@@ -13,6 +13,9 @@ __pycache__/
 .venv/
 venv/
 
+# WAV files
+*.wav
+
 # OS files
 .DS_Store
 Thumbs.db

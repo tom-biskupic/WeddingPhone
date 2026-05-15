@@ -12,18 +12,20 @@ Recording – ADC input from the KS0835 AUDIO_OUT pin.
             with the audio signal AC-coupled via a 100 nF capacitor.
 
 Dual-core strategy:
-  Core 1 – time-critical ADC sampling at a fixed rate.
-  Core 0 – this module's record_wav() method; streams chunks to the SD card.
+  Core 1 – time-critical ADC sampling at a fixed rate (_sampler_thread).
+  Core 0 – record_wav() streams completed chunks to the SD card.
 
-Both cores share two fixed-size bytearrays via a lightweight handshake
-(no locks needed: only one writer and one reader per buffer at a time).
+Chunks travel Core 1 → Core 0 through a _LockedFIFO (protected by a
+_thread lock).  Consumed chunks are returned to a free-buffer pool so no
+heap allocation occurs during recording.
 """
 
+import _thread
 import math
 import utime
 import struct
-import _thread
 from machine import PWM, ADC, Pin
+from debug import log
 
 # ---------------------------------------------------------------------------
 # Tone generation helpers (module-level, independent of AudioIO)
@@ -44,39 +46,116 @@ def _gcd(a: int, b: int) -> int:
     return a
 
 
-def _mk_loop_buf(f1: float, f2: float, rate: int) -> bytearray:
+def _mk_loop_buf(f1: float, f2: float, rate: int, f3: float = 0) -> bytearray:
     """
     Build the shortest cyclic PCM buffer that completes an integer number
-    of cycles for both f1 and f2 (or just f1 if f2 == 0).  Capped at
-    400 samples so computation stays fast even for awkward DTMF pairs.
+    of cycles for all supplied frequencies.  Capped at 400 samples so
+    computation stays fast even for awkward DTMF pairs.
     8-bit unsigned samples, amplitude 110/128 for headroom.
     """
+    g = _gcd(rate, int(round(f1)))
     if f2:
-        g = _gcd(int(round(f1)), int(round(f2)))
-    else:
-        g = _gcd(rate, int(round(f1)))
+        g = _gcd(g, int(round(f2)))
+    if f3:
+        g = _gcd(g, int(round(f3)))
     n = min(rate // g, 400)
     n = max(n, 40)
 
+    freqs = [f for f in (f1, f2, f3) if f]
     buf = bytearray(n)
-    a1  = 2.0 * math.pi * f1 / rate
-    a2  = 2.0 * math.pi * f2 / rate if f2 else 0.0
     for i in range(n):
-        s = math.sin(a1 * i)
-        if f2:
-            s = (s + math.sin(a2 * i)) * 0.5
-        buf[i] = int(s * 110) + 128
+        s = sum(math.sin(2.0 * math.pi * f / rate * i) for f in freqs)
+        buf[i] = int(s / len(freqs) * 110) + 128
     return buf
 
 
+# ---------------------------------------------------------------------------
+# Recording infrastructure
+# ---------------------------------------------------------------------------
+
+_CHUNK_SAMPLES = 4096   # ADC samples per buffer chunk (~0.5 s at 8 kHz)
+_NUM_CHUNKS    = 4      # pre-allocated chunks; covers ~2 s of write latency
+
+
+class _LockedFIFO:
+    """Thread-safe FIFO queue protected by a _thread lock."""
+
+    def __init__(self, initial=()):
+        self._lock = _thread.allocate_lock()
+        self._q    = list(initial)
+
+    def put(self, item):
+        self._lock.acquire()
+        self._q.append(item)
+        self._lock.release()
+
+    def get(self):
+        """Return the next item, or None if the queue is empty."""
+        self._lock.acquire()
+        item = self._q.pop(0) if self._q else None
+        self._lock.release()
+        return item
+
+
+def _sampler_thread(args):
+    """
+    Core 1 entry point.
+
+    Draws free chunk buffers from free_q, fills them with ADC samples at a
+    fixed period, and posts (buf, n) tuples onto data_q.  Releases done_lock
+    when sampling ends so that record_wav() knows to stop draining data_q.
+    """
+    adc, period_us, max_samples, hook, free_q, data_q, done_lock = args
+
+    total         = 0
+    on_hook_count = 0
+    hook_tick     = 0
+    stop          = False
+
+    while not stop:
+        # Draw a free buffer; spin-wait if the writer hasn't returned one yet.
+        buf = None
+        while buf is None:
+            buf = free_q.get()
+
+        n         = 0
+        chunk_len = len(buf)
+
+        while n < chunk_len and total < max_samples:
+            t = utime.ticks_us()
+            buf[n] = adc.read_u16() >> 8
+            n += 1
+            total += 1
+
+            hook_tick -= 1
+            if hook_tick <= 0:
+                hook_tick = 80
+                if not hook.is_off_hook():
+                    on_hook_count += 1
+                    if on_hook_count >= 5:
+                        stop = True
+                        break
+                else:
+                    on_hook_count = 0
+
+            while utime.ticks_diff(utime.ticks_us(), t) < period_us:
+                pass
+
+        if n:
+            data_q.put((buf, n))
+
+        if total >= max_samples:
+            stop = True
+
+    done_lock.release()  # signal record_wav() that sampling is complete
+
+
 class AudioIO:
-    # Each chunk = 0.5 s of audio.  Two chunks → one second of buffering.
-    # Large enough to hide SD-write latency; small enough to fit in RAM.
-    CHUNK = 4000   # samples  (0.5 s @ 8 kHz)
+    WRITE_CHUNK = 4096  # bytes per SD write call – keep a multiple of 512
 
     def __init__(self, pwm_pin: int, adc_pin: int, sample_rate: int = 8000):
         self._rate      = sample_rate
-        self._period_us = 1_000_000 // sample_rate   # µs between samples
+        self._period_us = 1_000_000 // sample_rate
         self._pwm_pin   = pwm_pin
 
         # PWM carrier at 250 kHz; 8-bit resolution (duty 0–255 scaled to 0–65535)
@@ -86,67 +165,16 @@ class AudioIO:
 
         self._adc = ADC(Pin(adc_pin))
 
-        # Double-buffer for recording
-        self._buf = [bytearray(self.CHUNK), bytearray(self.CHUNK)]
-        # _fill_idx  : which buffer Core 1 is currently writing into
-        # _write_idx : which buffer Core 0 should flush to SD
-        self._fill_idx  = 0
-        self._write_idx = 1
-
-        # Handshake flags (written by one core, read by the other)
-        # _buf_ready  – Core 1 → Core 0: a full buffer is waiting
-        # _buf_acked  – Core 0 → Core 1: Core 0 has taken the buffer
-        self._buf_ready = False
-        self._buf_acked = False
-
-        # Core 1 sets this True when it has finished sampling
-        self._rec_done = False
-
-    # ------------------------------------------------------------------
-    # Speech synthesis (TTS)
-    # ------------------------------------------------------------------
-
-    def speak(self, text: str, voice: str = "sam") -> None:
-        """
-        Synthesise speech from text and play it through the audio output pin.
-
-        Depends on the SAM TTS library for MicroPython:
-            https://github.com/kevinmcaleer/sam
-        Copy sam.py (and any bundled dependencies) onto the Pico alongside
-        this file.
-
-        voice choices: "sam", "robot", "elf", "old_man", "whisper",
-                       "alien", "giant", "child", "stuffy"
-
-        SAM uses RP2040 PIO for its output, so the PWM on the same pin must
-        be released first; it is re-initialised afterwards.
-        """
-        self._pwm.deinit()
-        try:
-            from sam import SAM                         # type: ignore
-            tts = SAM(pin=self._pwm_pin, voice=voice)
-            tts.say(text)
-        except ImportError:
-            print(
-                "audio: SAM library not found – "
-                "install from https://github.com/kevinmcaleer/sam"
-            )
-        finally:
-            # Restore PWM for WAV playback and the idle mid-rail state
-            self._pwm = PWM(Pin(self._pwm_pin))
-            self._pwm.freq(250_000)
-            self._pwm.duty_u16(32768)
-
     # ------------------------------------------------------------------
     # Telephone tones
     # ------------------------------------------------------------------
 
-    def _play_tone(self, f1: float, f2: float, duration_ms: int) -> None:
+    def _play_tone(self, f1: float, f2: float, duration_ms: int, f3: float = 0) -> None:
         """
-        Play a one- or two-frequency tone for duration_ms via PWM.
+        Play a one-, two-, or three-frequency tone for duration_ms via PWM.
         Uses a short cyclic buffer to avoid large allocations.
         """
-        cycle     = _mk_loop_buf(f1, f2, self._rate)
+        cycle     = _mk_loop_buf(f1, f2, self._rate, f3)
         total     = self._rate * duration_ms // 1000
         period_us = self._period_us
         played    = 0
@@ -167,8 +195,8 @@ class AudioIO:
         utime.sleep_ms(duration_ms)
 
     def play_dial_tone(self, duration_ms: int = 1500) -> None:
-        """Australian dial tone: 425 Hz continuous."""
-        self._play_tone(425.0, 0, duration_ms)
+        """Australian dial tone: 400 + 425 + 450 Hz continuous."""
+        self._play_tone(400.0, 425.0, duration_ms, f3=450.0)
 
     def play_dtmf(
         self,
@@ -213,13 +241,13 @@ class AudioIO:
             with open(filename, "rb") as f:
                 hdr = f.read(44)
                 if len(hdr) < 44 or hdr[0:4] != b"RIFF" or hdr[8:12] != b"WAVE":
-                    print(f"audio: {filename} is not a valid WAV file")
+                    log("audio: {} is not a valid WAV file".format(filename))
                     return
                 file_rate = struct.unpack_from("<I", hdr, 24)[0]
                 period_us = 1_000_000 // file_rate
                 bits      = struct.unpack_from("<H", hdr, 34)[0]
                 if bits != 8:
-                    print(f"audio: {filename} is {bits}-bit; only 8-bit supported")
+                    log("audio: {} is {}-bit; only 8-bit supported".format(filename, bits))
                     return
 
                 chunk = bytearray(256)
@@ -233,7 +261,7 @@ class AudioIO:
                         while utime.ticks_diff(utime.ticks_us(), t) < period_us:
                             pass
         except OSError as e:
-            print(f"audio: cannot play {filename}: {e}")
+            log("audio: cannot play {}: {}".format(filename, e))
         finally:
             self._pwm.duty_u16(32768)   # return to mid-rail
 
@@ -241,85 +269,98 @@ class AudioIO:
     # Recording
     # ------------------------------------------------------------------
 
+    def _apply_lowpass(self, buf, n_samples: int) -> None:
+        """4th-order Butterworth LPF at 3 kHz (fs=8 kHz), two cascaded biquads, in-place."""
+        # Coefficients from pre-warped bilinear transform
+        # Stage 1: Q = 1.3066
+        B0, B1, B2 = 0.6719, 1.3436, 0.6719
+        A1, A2     = 1.1130, 0.5741
+        # Stage 2: Q = 0.5412
+        C0, C1, C2 = 0.5163, 1.0325, 0.5163
+        D1, D2     = 0.8554, 0.2097
+
+        v0  = float(buf[0])
+        x1 = x2 = y1 = y2 = v0   # stage 1 delay lines
+        u1 = u2 = w1 = w2 = v0   # stage 2 delay lines
+
+        for i in range(n_samples):
+            x  = float(buf[i])
+            s  = B0*x  + B1*x1 + B2*x2 - A1*y1 - A2*y2
+            x2, x1 = x1, x
+            y2, y1 = y1, s
+            t  = C0*s  + C1*u1 + C2*u2 - D1*w1 - D2*w2
+            u2, u1 = u1, s
+            w2, w1 = w1, t
+            v = int(t + 0.5)
+            buf[i] = 0 if v < 0 else (255 if v > 255 else v)
+
     def record_wav(self, filename: str, max_seconds: int, hook) -> None:
         """
-        Stream audio from the ADC into a WAV file until:
-          - max_seconds have elapsed, or
-          - the handset is replaced (hook.is_off_hook() returns False).
+        Record audio to a WAV file using dual-core streaming.
 
-        hook must expose an is_off_hook() method (a KS0835 instance).
+        Core 1 (_sampler_thread) samples the ADC at a fixed rate and posts
+        chunk buffers onto data_q.  This method (Core 0) drains data_q and
+        writes each chunk to the SD card, returning the buffer to free_q for
+        reuse.  A done_lock (held here, released by the sampler) signals when
+        sampling has finished so this method can stop draining.
+
+        The WAV header is written as a placeholder first, then patched in-place
+        via seek(0) once the total sample count is known.
         """
-        self._buf_ready = False
-        self._buf_acked = False
-        self._rec_done  = False
-        self._fill_idx  = 0
-        self._write_idx = 1
+        chunk_pool = [bytearray(_CHUNK_SAMPLES) for _ in range(_NUM_CHUNKS)]
+        free_q     = _LockedFIFO(chunk_pool)
+        data_q     = _LockedFIFO()
 
-        max_chunks = (max_seconds * self._rate) // self.CHUNK
+        # done_lock: acquired (locked) here; sampler releases when done.
+        # Main polls done_lock.acquire(False) — succeeds only after release.
+        done_lock = _thread.allocate_lock()
+        done_lock.acquire()
 
-        _thread.start_new_thread(self._adc_thread, (max_chunks, hook))
+        args = (
+            self._adc, self._period_us, max_seconds * self._rate, hook,
+            free_q, data_q, done_lock,
+        )
+        _thread.start_new_thread(_sampler_thread, (args,))
+        log("audio: recording started, streaming to {}".format(filename))
 
-        total_samples = 0
+        total_written = 0
+        sampler_done  = False
+
         try:
             with open(filename, "wb") as f:
-                f.write(bytes(44))          # placeholder header
+                f.write(b'\x00' * 44)   # placeholder WAV header; patched below
 
-                while not self._rec_done or self._buf_ready:
-                    if self._buf_ready:
-                        # Grab the index Core 1 just finished
-                        idx = self._write_idx
-                        self._buf_acked = True   # signal Core 1 we have it
-                        self._buf_ready = False
+                while True:
+                    item = data_q.get()
 
-                        f.write(self._buf[idx])
-                        total_samples += self.CHUNK
-                    else:
-                        utime.sleep_ms(1)
+                    if item is not None:
+                        buf, n = item
+                        mv     = memoryview(buf)
+                        offset = 0
+                        while offset < n:
+                            end = min(offset + self.WRITE_CHUNK, n)
+                            f.write(mv[offset:end])
+                            offset = end
+                        total_written += n
+                        free_q.put(buf)   # return buffer to pool
+                        continue
 
-            # Back-fill the WAV header with correct sizes
-            with open(filename, "r+b") as f:
+                    # Queue was empty.
+                    if sampler_done:
+                        break   # sampler done and queue fully drained
+                    if done_lock.acquire(False):
+                        sampler_done = True   # loop once more to drain any final items
+                        continue
+                    utime.sleep_us(500)
+
+                # Patch the WAV header now that the total size is known.
                 f.seek(0)
-                f.write(_wav_header(total_samples, self._rate))
+                f.write(_wav_header(total_written, self._rate))
 
-            print(f"audio: saved {total_samples} samples "
-                  f"({total_samples // self._rate} s) → {filename}")
         except OSError as e:
-            print(f"audio: record error: {e}")
+            log("audio: write error: {}".format(e))
 
-    def _adc_thread(self, max_chunks: int, hook) -> None:
-        """Core 1: sample the ADC into the inactive buffer at a fixed rate."""
-        chunks = 0
-        pos    = 0
-        buf    = self._buf[self._fill_idx]
-
-        while chunks < max_chunks and hook.is_off_hook():
-            t = utime.ticks_us()
-
-            # 12-bit ADC → 8-bit unsigned PCM
-            buf[pos] = self._adc.read_u16() >> 8
-            pos += 1
-
-            if pos >= self.CHUNK:
-                # Buffer full: signal Core 0 to flush it
-                self._write_idx = self._fill_idx
-                self._buf_ready = True
-
-                # Swap to the other buffer
-                self._fill_idx = 1 - self._fill_idx
-                buf = self._buf[self._fill_idx]
-                pos = 0
-                chunks += 1
-
-                # Wait for Core 0 to acknowledge before we signal again
-                while not self._buf_acked:
-                    pass
-                self._buf_acked = False
-
-            # Spin-wait for the next sample slot
-            while utime.ticks_diff(utime.ticks_us(), t) < self._period_us:
-                pass
-
-        self._rec_done = True
+        log("audio: saved {} s -> {}".format(total_written // self._rate, filename))
 
 
 # ------------------------------------------------------------------

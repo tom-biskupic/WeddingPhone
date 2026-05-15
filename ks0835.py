@@ -3,7 +3,7 @@ KS0835 telephone line interface module driver.
 
 The module exposes five signals to the Pico; no SPI is involved:
 
-  HOOK       (input)  – pulled low by the module when the handset is lifted
+  HOOK       (input)  – driven high by the module when the handset is lifted
   RING_MODE  (output) – drive high to enable the ring circuitry
   FWD_REV    (output) – toggle at the ring frequency to modulate the ringer
   AUDIO_IN   (output) – analog audio from the Pico into the phone line
@@ -35,14 +35,14 @@ class KS0835:
         ring_mode_pin: int,
         fwd_rev_pin:   int,
         cadence=_CADENCE_AUS,
-        hook_active_low: bool = True,
+        hook_active_low: bool = False,
     ):
         """
         hook_pin        – GPIO number connected to the module HOOK output
         ring_mode_pin   – GPIO number connected to the module RING_MODE input
         fwd_rev_pin     – GPIO number connected to the module FWD/REV input
         cadence         – ring cadence list; defaults to AU/UK pattern
-        hook_active_low – True (default) if HOOK is active-low
+        hook_active_low – False (default) if HOOK is active-high
         """
         pull = Pin.PULL_UP if hook_active_low else Pin.PULL_DOWN
         self._hook      = Pin(hook_pin, Pin.IN, pull)

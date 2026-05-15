@@ -12,7 +12,7 @@ Flow
 Hardware summary
 ────────────────
   KS0835 board
-    HOOK      → GP6   (input, active-low: low = off-hook)
+    HOOK      → GP6   (input, active-high: high = off-hook)
     RING_MODE → GP7   (output: high = ring enabled)
     FWD/REV   → GP8   (output: toggled at ring frequency)
     AUDIO_OUT → GP26  (ADC0: analog audio from phone line)
@@ -24,13 +24,13 @@ Hardware summary
     MISO → GP12
     CS   → GP13
 
-RC filter for AUDIO_IN
-    GP15 ──┤1 kΩ├──┬── to KS0835 AUDIO_IN
-                   │
-                 39 nF
-                   │
-                  GND
-    (fc ≈ 4.1 kHz; adequate for 8 kHz telephony audio)
+RC filter + DC-blocking cap for AUDIO_IN
+    GP15 ──┤820 Ω├──┬──┤100 nF├── to KS0835 AUDIO_IN
+                    │
+                  47 nF
+                    │
+                   GND
+    (LP fc ≈ 4.1 kHz; 100 nF coupling cap blocks PWM DC offset)
 
 ADC bias for AUDIO_OUT
     3V3 ──┤10 kΩ├──┬── to KS0835 AUDIO_OUT
@@ -42,12 +42,14 @@ ADC bias for AUDIO_OUT
 """
 
 import machine
+import random
 import utime
 import os
 
 from machine import Pin, SPI
 
 import sdcard
+from debug   import log, enable as _enable_log
 from ks0835  import KS0835
 from audio   import AudioIO
 
@@ -75,12 +77,6 @@ SD_CS_PIN   = 13
 # Application settings
 # ======================================================================
 
-GREETING_TEXT = (
-    "Hello! Thank you for coming to our wedding. "
-    "Please leave us a message after the tone."
-)
-GREETING_VOICE = "old_man"   # sam | robot | elf | old_man | whisper | etc.
-
 # Telephone sound sequence played immediately after the handset is lifted.
 # Simulates: dial tone → subscriber dialling → ringback → greeting.
 DIAL_TONE_MS   = 1200        # duration of the initial dial tone
@@ -89,30 +85,70 @@ DTMF_TONE_MS   = 100         # on-time per DTMF digit
 DTMF_GAP_MS    = 80          # silence between DTMF digits
 RING_BURSTS    = 1           # how many AU ring cadences before greeting
 
-ENABLE_SD      = False                # set True to mount SD and record messages
+ENABLE_SD      = True                # set True to mount SD and record messages
 
 RECORDING_DIR  = "/sd/recordings"
 SAMPLE_RATE    = 8000                 # Hz
 MAX_REC_SECS   = 60                   # maximum guest message length
 
+GREETING_FILE = "greeting.wav"
+
+# Random idle-ring interval: ring once every 8–12 minutes while waiting
+IDLE_RING_MIN_S  = 8 * 60
+IDLE_RING_MAX_S  = 12 * 60
+IDLE_RING_CYCLES = 2        # AU cadence cycles per idle ring burst
+
+TEST_STARTUP_RING = True    # ring once a few seconds after boot; disable before event
+
 # ======================================================================
 # Helpers
 # ======================================================================
 
+def _wait_for_pickup(slic: KS0835) -> None:
+    """
+    Block until the handset is lifted.  While idle, ring the phone once
+    every 8–12 minutes (random) to attract guests' attention.
+    slic.ring() uses the AU cadence and returns early if the handset is lifted.
+    """
+    def _next_ring_ms():
+        return utime.ticks_add(
+            utime.ticks_ms(),
+            random.randint(IDLE_RING_MIN_S, IDLE_RING_MAX_S) * 1000,
+        )
+
+    ring_at = _next_ring_ms()
+
+    while True:
+        if slic.is_off_hook():
+            utime.sleep_ms(50)      # debounce
+            if slic.is_off_hook():
+                return
+
+        if utime.ticks_diff(utime.ticks_ms(), ring_at) >= 0:
+            log("Idle ring")
+            slic.ring(IDLE_RING_CYCLES)
+            ring_at = _next_ring_ms()
+            if slic.is_off_hook():
+                return
+
+        utime.sleep_ms(20)
+
+
 def _mount_sd() -> None:
     spi = SPI(
         SD_SPI_BUS,
-        baudrate=10_000_000,
+        baudrate=100_000,
         polarity=0, phase=0,
         sck=Pin(SD_SCK_PIN),
         mosi=Pin(SD_MOSI_PIN),
         miso=Pin(SD_MISO_PIN),
     )
     cs   = Pin(SD_CS_PIN, Pin.OUT, value=1)
-    card = sdcard.SDCard(spi, cs)
+    card = sdcard.SDCard(spi, cs, baudrate=200_000)
     vfs  = os.VfsFat(card)
     os.mount(vfs, "/sd")
-    print("SD card mounted")
+    # _enable_log()
+    log("SD card mounted")
 
 
 def _ensure_recording_dir() -> None:
@@ -141,7 +177,7 @@ def _next_filename() -> str:
 # ======================================================================
 
 def main() -> None:
-    print("Wedding Phone – starting")
+    log("Wedding Phone – starting")
 
     if ENABLE_SD:
         _mount_sd()
@@ -150,12 +186,17 @@ def main() -> None:
     slic     = KS0835(HOOK_PIN, RING_MODE_PIN, FWD_REV_PIN)
     audio_io = AudioIO(AUDIO_OUT_PWM, AUDIO_IN_ADC, SAMPLE_RATE)
 
-    print("Ready – waiting for guests")
+    log("Ready – waiting for guests")
+
+    if TEST_STARTUP_RING:
+        utime.sleep_ms(3000)
+        log("Test ring")
+        slic.ring(1)
 
     while True:
         # ── IDLE: wait for off-hook ──────────────────────────────────
-        slic.wait_off_hook()
-        print("Handset lifted")
+        _wait_for_pickup(slic)
+        log("Handset lifted")
 
         # ── DIAL TONE → DTMF → RINGBACK ─────────────────────────────
         utime.sleep_ms(200)                          # line-settle pause
@@ -164,26 +205,28 @@ def main() -> None:
         audio_io.play_ring_tone(RING_BURSTS)
 
         # ── GREETING ────────────────────────────────────────────────
-        print("Playing greeting")
-        audio_io.speak(GREETING_TEXT, GREETING_VOICE)
-
+        log("Playing greeting")
+        audio_io.play_wav(GREETING_FILE)
         # If the guest hung up during the greeting, go back to idle
-        if not slic.is_off_hook():
-            print("Handset replaced during greeting")
+        hook_after_greeting = slic.is_off_hook()
+        log("Hook after greeting: {}".format(hook_after_greeting))
+        if not hook_after_greeting:
+            log("Handset replaced during greeting – returning to idle")
             continue
 
         # ── RECORD ──────────────────────────────────────────────────
         if ENABLE_SD:
             filename = _next_filename()
-            print(f"Recording → {filename}")
+            log("Recording → {}".format(filename))
             audio_io.record_wav(filename, MAX_REC_SECS, slic)
+            log("Recording finished")
         else:
-            print("SD disabled – skipping recording, waiting for hang-up")
+            log("SD disabled – skipping recording, waiting for hang-up")
             while slic.is_off_hook():
                 utime.sleep_ms(100)
 
         # ── HANG-UP ─────────────────────────────────────────────────
-        print("Message done – waiting for next guest\n")
+        log("Message done – waiting for next guest")
         utime.sleep_ms(200)
 
 
