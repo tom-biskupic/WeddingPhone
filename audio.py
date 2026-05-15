@@ -1,19 +1,19 @@
 """
 Audio I/O for the Raspberry Pi Pico.
 
-Playback  – 8-bit unsigned PCM WAV → PWM output → RC low-pass filter.
+Playback  - 8-bit unsigned PCM WAV → PWM output → RC low-pass filter.
             Recommended filter: R=1kΩ, C=39nF (fc ≈ 4.1 kHz).
             Connect the filtered output to the KS0835 AUDIO_IN pin.
 
-Recording – ADC input from the KS0835 AUDIO_OUT pin.
+Recording - ADC input from the KS0835 AUDIO_OUT pin.
             The SLIC output must be DC-biased to ~1.65 V (half of 3.3 V)
-            so the Pico ADC sees the full 0–3.3 V swing.
-            A simple bias circuit: 2×10 kΩ voltage divider to 3.3 V,
+            so the Pico ADC sees the full 0-3.3 V swing.
+            A simple bias circuit: 2x10 kΩ voltage divider to 3.3 V,
             with the audio signal AC-coupled via a 100 nF capacitor.
 
 Dual-core strategy:
-  Core 1 – time-critical ADC sampling at a fixed rate (_sampler_thread).
-  Core 0 – record_wav() streams completed chunks to the SD card.
+  Core 1 - time-critical ADC sampling at a fixed rate (_sampler_thread).
+  Core 0 - record_wav() streams completed chunks to the SD card.
 
 Chunks travel Core 1 → Core 0 through a _LockedFIFO (protected by a
 _thread lock).  Consumed chunks are returned to a free-buffer pool so no
@@ -151,14 +151,14 @@ def _sampler_thread(args):
 
 
 class AudioIO:
-    WRITE_CHUNK = 4096  # bytes per SD write call – keep a multiple of 512
+    WRITE_CHUNK = 4096  # bytes per SD write call - keep a multiple of 512
 
     def __init__(self, pwm_pin: int, adc_pin: int, sample_rate: int = 8000):
         self._rate      = sample_rate
         self._period_us = 1_000_000 // sample_rate
         self._pwm_pin   = pwm_pin
 
-        # PWM carrier at 250 kHz; 8-bit resolution (duty 0–255 scaled to 0–65535)
+        # PWM carrier at 250 kHz; 8-bit resolution (duty 0-255 scaled to 0-65535)
         self._pwm = PWM(Pin(pwm_pin))
         self._pwm.freq(250_000)
         self._pwm.duty_u16(32768)   # mid-rail idle  (silence = 128 << 8)
@@ -206,9 +206,9 @@ class AudioIO:
     ) -> None:
         """
         Play a DTMF digit sequence.
-        digits   – string of '0'–'9', '*', or '#'
-        tone_ms  – on duration per digit
-        gap_ms   – silence between digits (and after the last)
+        digits   - string of '0'-'9', '*', or '#'
+        tone_ms  - on duration per digit
+        gap_ms   - silence between digits (and after the last)
         """
         for ch in digits:
             freqs = _DTMF_FREQS.get(ch)

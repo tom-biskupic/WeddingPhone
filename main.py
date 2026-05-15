@@ -1,13 +1,13 @@
 """
-Wedding Phone – MicroPython application for the Raspberry Pi Pico.
+Wedding Phone - MicroPython application for the Raspberry Pi Pico.
 
 Flow
 ────
-  1. Idle – wait for a guest to lift the handset (off-hook).
-  2. Off-hook – open audio path; short pause for line to settle.
+  1. Idle - wait for a guest to lift the handset (off-hook).
+  2. Off-hook - open audio path; short pause for line to settle.
   3. Speak a greeting using SAM TTS synthesis.
   4. Record the guest's message to a new WAV file on the SD card.
-  5. Hang-up – clean up, return to idle.
+  5. Hang-up - clean up, return to idle.
 
 Hardware summary
 ────────────────
