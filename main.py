@@ -91,7 +91,16 @@ RECORDING_DIR  = "/sd/recordings"
 SAMPLE_RATE    = 8000                 # Hz
 MAX_REC_SECS   = 60                   # maximum guest message length
 
-GREETING_FILE = "greeting.wav"
+GREETING_FILES = []
+for _i in range(1, 11):
+    _f = "greeting{}.wav".format(_i)
+    try:
+        os.stat(_f)
+        GREETING_FILES.append(_f)
+    except OSError:
+        pass
+if not GREETING_FILES:
+    GREETING_FILES = ["greeting.wav"]
 
 # Random idle-ring interval: ring once every 8–12 minutes while waiting
 IDLE_RING_MIN_S  = 8 * 60
@@ -205,8 +214,9 @@ def main() -> None:
         audio_io.play_ring_tone(RING_BURSTS)
 
         # ── GREETING ────────────────────────────────────────────────
-        log("Playing greeting")
-        audio_io.play_wav(GREETING_FILE)
+        greeting = random.choice(GREETING_FILES)
+        log("Playing greeting: {}".format(greeting))
+        audio_io.play_wav(greeting)
         # If the guest hung up during the greeting, go back to idle
         hook_after_greeting = slic.is_off_hook()
         log("Hook after greeting: {}".format(hook_after_greeting))
